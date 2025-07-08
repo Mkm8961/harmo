@@ -164,16 +164,29 @@ validation_filter = st.radio("Filter materials by status", ["All", "Valid", "Inv
 
 filtered_status_df = classify_status(filtered_df)
 
+# Combine material number and description
+filtered_status_df["Display"] = (
+    filtered_status_df["MATERIAL_NUMBER"].astype(str) +
+    " - " +
+    filtered_status_df["MATERIAL_NUMBER_TEXT"]
+)
+
 if validation_filter != "All":
     filtered_status_df = filtered_status_df[filtered_status_df["Validation_Status"] == validation_filter]
 
-selected = st.selectbox("Select a material description", filtered_status_df["MATERIAL_NUMBER_TEXT"])
+# Dropdown and mapping
+selected_display = st.selectbox("Select a material description", filtered_status_df["Display"])
+selected_row = filtered_status_df[filtered_status_df["Display"] == selected_display].iloc[0]
+selected = selected_row["MATERIAL_NUMBER_TEXT"]
+material_number = selected_row["MATERIAL_NUMBER"]
 sel_type = selected.split(",")[0].strip().upper()
+
 valid, missing_parts = validate_with_reason(selected)
 suggestion = build_full_suggestion(selected, sel_type, missing_parts)
 
 with st.container():
     st.markdown("#### ✨ Validation Result")
+    st.markdown(f"**Material Number:** `{material_number}`")
     st.markdown(f"**Selected Material:** `{selected}`")
 
     if valid:
@@ -192,7 +205,7 @@ if "corrections" not in st.session_state:
     st.session_state["corrections"] = []
 
 if st.button("💾 Save Correction"):
-    st.session_state["corrections"].append({"Original": selected, "Corrected": corrected})
+    st.session_state["corrections"].append({"Material Number": material_number, "Original": selected, "Corrected": corrected})
     st.success("✅ Correction saved!")
 
 if st.session_state["corrections"]:
