@@ -1,223 +1,240 @@
 import streamlit as st
 import pandas as pd
-from rapidfuzz import process
+from transformers import AutoTokenizer, AutoModel
+import torch
+import numpy as np
 
-st.set_page_config(page_title="Material Validator", layout="wide")
-st.title("Material Validator & Suggester")
+st.set_page_config(page_title="Smart Material Validator", layout="wide")
+st.title("📦 Smart Material Description Validator (Merged with Roberta Fallback)")
 
-# --- Inject custom CSS for beautification ---
-st.markdown("""
-    <style>
-        .material-box {
-            border: 1px solid #CCC;
-            border-radius: 8px;
-            padding: 16px;
-            margin-bottom: 15px;
-            background-color: #F9F9F9;
-            box-shadow: 1px 1px 5px rgba(0,0,0,0.05);
-        }
-        .status-valid {
-            color: green;
-            font-weight: bold;
-        }
-        .status-invalid {
-            color: red;
-            font-weight: bold;
-        }
-        .header-section {
-            background-color: #e8f4fa;
-            padding: 12px;
-            border-radius: 6px;
-            margin-top: 10px;
-            margin-bottom: 20px;
-            font-size: 18px;
-            font-weight: 600;
-            border-left: 4px solid #1f77b4;
-        }
-    </style>
-""", unsafe_allow_html=True)
-
-# 📤 Upload CSV
-st.markdown('<div class="header-section">📤 Upload Your Material File</div>', unsafe_allow_html=True)
-uploaded_file = st.file_uploader("Upload your material CSV file", type="csv")
-if not uploaded_file:
+# --- Upload CSV ---
+st.sidebar.header("📤 Upload")
+uploaded_file = st.sidebar.file_uploader("Upload CSV", type=["csv"])
+if uploaded_file is None:
+    st.warning("Upload a file to continue.")
     st.stop()
 df = pd.read_csv(uploaded_file)
 
-# 🔧 Setup
-valid_types = ["PIPE", "NIPPLE", "VALVE", "BOLT", "STUD", "FLANGE", "STOPPER", "STOPPLE", "ELL", "ELBOW"]
-df["UPPER_DESC"] = df["MATERIAL_NUMBER_TEXT"].astype(str).str.upper()
-filtered_df = df[df["UPPER_DESC"].str.split(",").str[0].str.strip().isin(valid_types)].copy()
-filtered_df["Type"] = filtered_df["UPPER_DESC"].str.split(",").str[0].str.strip()
+# --- Valid material types (for rule-based logic) ---
+valid_types = [
+    "ADAPTER", "CONNECTOR", "BARRICADE", "BEND", "BUSHING", "CAP", "CATHODIC PROTECTION", "CLAMP",
+    "COUPLING", "ELBOW", "FLANGE", "FLANGE GASKET", "GAS METER", "GAS METER AND METERSET PARTS",
+    "GAUGE", "INSULATOR", "NIPPLE", "OPERATIONS ITEM", "OUTLET", "PLASTIC PIPE", "STEEL PIPE",
+    "PLUG", "INSERT PROTECTOR", "REDUCER", "REGULATOR", "REGULATOR PARTS", "RELIEF VALVE",
+    "SIGNAGE/LOCATE MATERIAL", "SLEEVE", "STIFFENER", "STOPPER", "STRAINER", "STUDS & SCREWS",
+    "TEE", "TRANSITION", "UNION", "VALVE", "VALVE PARTS"
+]
 
-@st.cache_data
-def get_suggestions_map(df):
-    suggestions = {}
-    for t in valid_types:
-        descs = df[df["MATERIAL_NUMBER_TEXT"].str.upper().str.startswith(t)]["MATERIAL_NUMBER_TEXT"].tolist()
-        suggestions[t] = descs
-    return suggestions
+# --- Preprocess descriptions ---
+df['UPPER_DESC'] = df['MATERIAL_NUMBER_TEXT'].astype(str).str.upper()
+df['TYPE'] = df['UPPER_DESC'].str.split(',').str[0].str.strip()
+filtered_df = df.copy()
 
-suggestion_map = get_suggestions_map(df)
+# --- Load Roberta ---
+@st.cache_resource
+def load_roberta():
+    tokenizer = AutoTokenizer.from_pretrained("sentence-transformers/all-roberta-large-v1")
+    model = AutoModel.from_pretrained("sentence-transformers/all-roberta-large-v1")
+    return tokenizer, model
 
-def validate_with_reason(desc):
-    parts = [p.strip().upper() for p in desc.split(",")]
-    type_ = parts[0] if parts else ""
+tokenizer, roberta_model = load_roberta()
 
-    def match_any(keywords):
-        return any(any(k in p for k in keywords) for p in parts)
+def get_roberta_embedding(text):
+    tokens = tokenizer(text, return_tensors="pt", padding=True, truncation=True)
+    with torch.no_grad():
+        outputs = roberta_model(**tokens)
+    return outputs.last_hidden_state[:, 0].numpy()
 
-    missing = []
+# --- Rule-based validation function ---
+def get_missing_parts(mat_type: str, parts: list[str]) -> list[str]:
+    parts = [p.strip().upper() for p in parts]
+    miss = []
 
-    if type_ == "PIPE":
-        if not match_any(["W", "WT"]): missing.append("wall thickness")
-        if not match_any(["X", "Y", "API"]): missing.append("grade")
-        if not match_any(["COAT", "WRAP", "DUALCOAT", "PEB", "ERW", "FBE"]): missing.append("coating")
-        return (len(missing) == 0), missing
+    if mat_type not in valid_types:
+        miss.append("TYPE NOT RECOGNISED")
+        return miss
 
-    if type_ == "NIPPLE":
-        if not match_any(["X"]): missing.append("size")
-        if "TOE" not in parts: missing.append("TOE")
-        if not match_any(["BLK", "GALV", "ZINC", "SC"]): missing.append("material")
-        return (len(missing) == 0), missing
+    if mat_type in {"STEEL PIPE", "PLASTIC PIPE"}:
+        if not any(x in parts for x in ["COAT", "WRAP", "DUALCOAT", "PE", "FBE"]):
+            miss.append("coating")
+        if not any("W" in p for p in parts):
+            miss.append("wall thickness")
+        if not any(x in parts for x in ["X", "Y", "API"]):
+            miss.append("grade")
+        if not any(p.replace(".", "", 1).isdigit() for p in parts):
+            miss.append("diameter")
 
-    if type_ == "FLANGE":
-        if not match_any(["WN", "SLIPON", "THRD", "RF", "FF", "RTJ"]): missing.append("flange type")
-        if not match_any(["150", "300"]): missing.append("pressure rating")
-        if not match_any(["CS", "CARBON", "STL"]): missing.append("material")
-        return (len(missing) == 0), missing
+    elif mat_type == "NIPPLE":
+        if not any("X" in p for p in parts):
+            miss.append("size")
+        if "TOE" not in parts:
+            miss.append("TOE")
+        if not any(x in parts for x in ["BLK", "GALV", "ZINC", "SC"]):
+            miss.append("material")
 
-    if type_ in ["BOLT", "STUD"]:
-        if not match_any(["X"]): missing.append("size")
-        if not match_any(["STEEL", "CARBON"]): missing.append("material")
-        return (len(missing) == 0), missing
+    elif mat_type == "VALVE":
+        if not any(x in parts for x in ["BALL", "GATE", "CHECK", "PLUG"]):
+            miss.append("valve type")
+        if not any(x in parts for x in ["150A", "300A", "600A", "CL150", "CL300"]):
+            miss.append("pressure rating")
+        if not any(x in parts for x in ["FE RF", "FLANGED", "THRD", "SOCKET"]):
+            miss.append("end type")
+        if not any(x in parts for x in ["FP", "FULL PORT", "RP"]):
+            miss.append("port type")
 
-    if type_ == "VALVE":
-        if not match_any(["BALL", "GATE", "CHECK", "PLUG"]): missing.append("valve type")
-        if not match_any(["150A", "300A", "600A"]): missing.append("pressure rating")
-        if not match_any(["FE RF", "FLANGED", "THRD"]): missing.append("end type")
-        if not match_any(["FP", "FULL PORT"]): missing.append("port type")
-        return (len(missing) == 0), missing
+    elif mat_type == "FLANGE":
+        if not any(x in parts for x in ["WN", "SLIPON", "THRD", "SOCKET", "LAP JOINT"]):
+            miss.append("flange type")
+        if not any(x in parts for x in ["RF", "FF", "RTJ"]):
+            miss.append("face type")
+        if not any(x in parts for x in ["150A", "300A", "600A", "CL150", "CL300", "CL600"]):
+            miss.append("rating")
+        if not any(x in parts for x in ["CS", "CARBON", "STL"]):
+            miss.append("material")
 
-    if type_ in ["ELL", "ELBOW"]:
-        if not match_any(["45", "90"]): missing.append("angle")
-        if not match_any(["WELD", "THRD", "SOCKET"]): missing.append("connection type")
-        if not match_any(["LR", "SR"]): missing.append("radius")
-        return (len(missing) == 0), missing
+    elif mat_type in {"ELBOW", "TEE", "BEND"}:
+        if not any(x in parts for x in ["90", "45"]):
+            miss.append("angle")
+        if not any(x in parts for x in ["LR", "SR"]):
+            miss.append("radius")
+        if not any(x in parts for x in ["WELD", "THRD", "SOCKET"]):
+            miss.append("connection type")
 
-    if type_ in ["STOPPER", "STOPPLE"]:
-        if not match_any(["WELD", "THRD"]): missing.append("weld/thread")
-        if not any(p.replace('"', '').isdigit() for p in parts): missing.append("size")
-        if not match_any(["#", "150A", "ANSI", "CL600"]): missing.append("pressure rating")
-        return (len(missing) == 0), missing
+    elif mat_type == "STOPPER":
+        if not any(x in parts for x in ["WELD", "THRD"]):
+            miss.append("end type")
+        if not any(p.replace('"', "").isdigit() for p in parts):
+            miss.append("size")
+        if not any(x in parts for x in ["#150", "CL150", "150A"]):
+            miss.append("pressure rating")
 
-    return False, ["unknown or unsupported type"]
+    elif mat_type == "CAP":
+        if not any(x in parts for x in ["THRD", "SOCKET", "WELD"]):
+            miss.append("connection type")
+        if not any(p.replace('"', "").isdigit() for p in parts):
+            miss.append("size")
 
-def build_full_suggestion(desc, type_, missing_parts):
-    candidates = suggestion_map.get(type_, [])
-    keyword_map = {
-        "wall thickness": ["W", "WT"],
-        "grade": ["X", "Y", "API"],
-        "coating": ["COAT", "WRAP", "DUALCOAT", "PEB", "ERW", "FBE"],
-        "size": ["X", '"', "INCH", "MM"],
-        "TOE": ["TOE"],
-        "material": ["BLK", "GALV", "ZINC", "SC", "STEEL", "CARBON", "CS", "STL"],
-        "flange type": ["WN", "SLIPON", "THRD", "RF", "FF", "RTJ"],
-        "pressure rating": ["150", "150A", "300", "300A", "600A", "#", "ANSI", "CL600"],
-        "valve type": ["BALL", "GATE", "CHECK", "PLUG"],
-        "end type": ["FE RF", "FLANGED", "THRD"],
-        "port type": ["FP", "FULL PORT"],
-        "angle": ["45", "90"],
-        "connection type": ["WELD", "THRD", "SOCKET"],
-        "radius": ["LR", "SR"],
-        "weld/thread": ["WELD", "THRD"]
-    }
+    elif mat_type == "COUPLING":
+        if not any(x in parts for x in ["INSULATING", "COMP", "COMPRESSION", "TRANSITION"]):
+            miss.append("type")
+        if not any(p.replace('"', "").isdigit() for p in parts):
+            miss.append("size")
 
-    original_parts = [p.strip().upper() for p in desc.split(",") if p.strip()]
-    original_set = set(original_parts)
+    elif mat_type == "REDUCER":
+        if not any("X" in p for p in parts):
+            miss.append("size format")
+        if not any(x in parts for x in ["ECC", "CONC"]):
+            miss.append("concentric/eccentric type")
 
-    miss_keywords = []
-    for m in missing_parts:
-        miss_keywords += keyword_map.get(m.lower(), [])
+    elif mat_type == "UNION":
+        if not any(x in parts for x in ["THRD", "SOCKET"]):
+            miss.append("end type")
+        if not any(p.replace('"', "").isdigit() for p in parts):
+            miss.append("size")
 
-    for c in candidates:
-        candidate_parts = [p.strip().upper() for p in c.split(",")]
-        if all(any(k in p for p in candidate_parts) for k in miss_keywords):
-            for token in candidate_parts:
-                if token not in original_set:
-                    original_parts.append(token)
-            return ", ".join(original_parts)
+    elif mat_type == "PLUG":
+        if not any(x in parts for x in ["HEX", "ROUND"]):
+            miss.append("head type")
+        if not any(x in parts for x in ["THRD", "SOCKET"]):
+            miss.append("end type")
 
-    return "No complete match found"
+    elif mat_type == "GAUGE":
+        if not any(x in parts for x in ["PSI", "BAR", "MMWC"]):
+            miss.append("unit")
+        if not any(p.replace(".", "", 1).isdigit() for p in parts):
+            miss.append("pressure range")
 
-@st.cache_data
-def classify_status(df):
-    df = df.copy()
-    df["Validation_Status"] = df["MATERIAL_NUMBER_TEXT"].apply(
-        lambda x: "Valid" if validate_with_reason(x)[0] else "Invalid"
-    )
-    return df
+    elif mat_type == "CLAMP":
+        if not any(x in parts for x in ["WELD", "THRD"]):
+            miss.append("end type")
+        if not any(p.replace('"', "").isdigit() for p in parts):
+            miss.append("size")
+        if not any(x in parts for x in ["#150", "CL150", "150A"]):
+            miss.append("pressure rating")
 
-# --- Explore & Validate with Filter ---
-st.markdown('<div class="header-section">🔍 Explore & Validate</div>', unsafe_allow_html=True)
-validation_filter = st.radio("Filter materials by status", ["All", "Valid", "Invalid"], horizontal=True)
+    return miss
 
-filtered_status_df = classify_status(filtered_df)
+# --- Roberta fallback suggestion ---
+def suggest_similar_roberta(input_text, type_):
+    input_emb = get_roberta_embedding(input_text)
+    candidates = filtered_df[filtered_df['TYPE'] == type_]['MATERIAL_NUMBER_TEXT'].tolist()
+    if not candidates:
+        return "No similar material found"
+    candidate_embs = np.vstack([get_roberta_embedding(c) for c in candidates])
+    scores = np.dot(candidate_embs, input_emb.T).squeeze()
+    best_match = np.argmax(scores)
+    return candidates[best_match]
 
-# Combine material number and description
-filtered_status_df["Display"] = (
-    filtered_status_df["MATERIAL_NUMBER"].astype(str) +
-    " - " +
-    filtered_status_df["MATERIAL_NUMBER_TEXT"]
-)
+# --- Suggestion Builder ---
+def build_suggestion(desc, type_, missing_parts):
+    if type_ in valid_types:
+        candidates = filtered_df[filtered_df['TYPE'] == type_]['MATERIAL_NUMBER_TEXT'].tolist()
+        parts = [p.strip().upper() for p in desc.split(",") if p.strip()]
+        for c in candidates:
+            cand_parts = [p.strip().upper() for p in c.split(",") if p.strip()]
+            if all(any(k in cp for cp in cand_parts) for k in missing_parts):
+                for token in cand_parts:
+                    if token not in parts:
+                        parts.append(token)
+                return ", ".join(parts)
+    return suggest_similar_roberta(desc, type_)
 
-if validation_filter != "All":
-    filtered_status_df = filtered_status_df[filtered_status_df["Validation_Status"] == validation_filter]
+# --- Validation Loop ---
+results = []
+for _, row in filtered_df.iterrows():
+    desc = row['MATERIAL_NUMBER_TEXT']
+    parts = [p.strip().upper() for p in desc.split(",") if p.strip()]
+    type_ = row['TYPE']
+    missing = get_missing_parts(type_, parts)
+    valid = len(missing) == 0
+    suggestion = build_suggestion(desc, type_, missing) if not valid else ""
+    results.append({
+        "Material Number": row['MATERIAL_NUMBER'],
+        "Description": desc,
+        "Type": type_,
+        "Status": "Valid" if valid else "Invalid",
+        "Missing Parts": ", ".join(missing) if not valid else "",
+        "Suggested Completion": suggestion
+    })
 
-# Dropdown and mapping
-selected_display = st.selectbox("Select a material description", filtered_status_df["Display"])
-selected_row = filtered_status_df[filtered_status_df["Display"] == selected_display].iloc[0]
-selected = selected_row["MATERIAL_NUMBER_TEXT"]
-material_number = selected_row["MATERIAL_NUMBER"]
-sel_type = selected.split(",")[0].strip().upper()
+results_df = pd.DataFrame(results)
 
-valid, missing_parts = validate_with_reason(selected)
-suggestion = build_full_suggestion(selected, sel_type, missing_parts)
-
-with st.container():
-    st.markdown("#### ✨ Validation Result")
-    st.markdown(f"**Material Number:** `{material_number}`")
-    st.markdown(f"**Selected Material:** `{selected}`")
-
-    if valid:
-        st.markdown('<span class="status-valid">✅ Valid - Passes all rules</span>', unsafe_allow_html=True)
-    else:
-        st.markdown('<span class="status-invalid">❌ Invalid</span>', unsafe_allow_html=True)
-        st.markdown(f"**Missing Parts:** {', '.join(missing_parts)}")
-
-        if suggestion != "No complete match found":
-            st.markdown(f"🔧 **Suggested Full Description:** `{suggestion}`")
-        else:
-            st.warning("⚠️ No full suggestion found in historical data.")
-
-corrected = st.text_input("✏️ Edit if needed", value=suggestion if suggestion != "No complete match found" else selected)
+# --- Setup session state for corrections ---
 if "corrections" not in st.session_state:
     st.session_state["corrections"] = []
 
-if st.button("💾 Save Correction"):
-    st.session_state["corrections"].append({"Material Number": material_number, "Original": selected, "Corrected": corrected})
-    st.success("✅ Correction saved!")
+# --- UI Tabs ---
+tabs = st.tabs(["✅ Valid", "❌ Invalid", "📘 Corrections", "📊 Summary"])
 
-if st.session_state["corrections"]:
-    st.markdown('<div class="header-section">📘 Saved Corrections</div>', unsafe_allow_html=True)
-    st.dataframe(pd.DataFrame(st.session_state["corrections"]))
+with tabs[0]:
+    st.subheader("✅ Valid Material Descriptions")
+    st.dataframe(results_df[results_df['Status'] == "Valid"])
 
-if st.checkbox("📊 Show validation summary"):
-    @st.cache_data
-    def get_summary(df):
-        summary_df = df.copy()
-        summary_df["Status"] = summary_df["MATERIAL_NUMBER_TEXT"].apply(
-            lambda x: "Valid" if validate_with_reason(x)[0] else "Invalid"
-        )
-        return summary_df.groupby(["Type", "Status"]).size().unstack(fill_value=0)
-    st.dataframe(get_summary(filtered_df))
+with tabs[1]:
+    st.subheader("❌ Invalid Descriptions")
+    filter_type = st.selectbox("Filter by Material Type", sorted(results_df["Type"].unique()))
+    inv_df = results_df[(results_df['Status'] == "Invalid") & (results_df['Type'] == filter_type)]
+    for _, row in inv_df.iterrows():
+        with st.expander(f"{row['Material Number']} - {row['Description']}"):
+            st.markdown(f"**Missing Parts:** {row['Missing Parts']}")
+            st.markdown(f"**Suggestion:** `{row['Suggested Completion']}`")
+            corrected = st.text_input("✏️ Edit if needed", value=row['Suggested Completion'], key=row['Material Number'])
+            if st.button("💾 Save Correction", key=f"btn_{row['Material Number']}"):
+                st.session_state["corrections"].append({
+                    "Material Number": row["Material Number"],
+                    "Original": row["Description"],
+                    "Corrected": corrected
+                })
+                st.success("Saved!")
+
+with tabs[2]:
+    st.subheader("📘 Saved Corrections")
+    if st.session_state["corrections"]:
+        st.dataframe(pd.DataFrame(st.session_state["corrections"]))
+    else:
+        st.info("No corrections saved yet.")
+
+with tabs[3]:
+    st.subheader("📊 Validation Summary")
+    summary = results_df.groupby(["Type", "Status"]).size().unstack(fill_value=0)
+    st.dataframe(summary)
